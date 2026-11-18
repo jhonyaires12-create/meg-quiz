@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>MEG Quiz · Jugar</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,600;0,700;0,800;0,900;1,600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="bg-shapes"><span></span><span></span><span></span><span></span></div>
+<div class="offline" id="offline">Reconectando…</div>
+<div class="app player">
+  <div class="player-top" id="top" hidden>
+    <div class="me"><span id="top-avatar"></span><span id="top-name"></span></div>
+    <div class="score" id="top-score">0</div>
+  </div>
+  <div class="player-main" id="main"></div>
+</div>
+
+<script src="/common.js"></script>
+<script>
+'use strict';
+const STORAGE_KEY = 'meg-quiz-player';
+const AVATARS = ['🦁','🐯','🐼','🦊','🐸','🐵','🐧','🦉','🐙','🦄','🐢','🐬','🦖','🐝','🐨','🐻','🦜','🐳'];
+const MESSAGES = {
+  right: ['¡Correcto! 🎉', '¡Eso es! 🙌', '¡Tremendo! 🔥', '¡Qué crack! 😎'],
+  wrong: ['¡Casi! 😅', '¡Uy! Para la próxima 💪', '¡Nooo! 🙈', '¡Ay, por poquito! 🫣'],
+  timeout: ['¡Se acabó el tiempo! ⏰'],
+  thanks: ['¡Gracias por participar! 🙌', '¡Anotado! ✍️'],
+};
+
+const main = $('#main');
+let player = loadPlayer();
+let liveSource = null;
+let lastRenderKey = '';
+let lastState = null;
+
+function loadPlayer() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY)); } catch { return null; }
+}
+function savePlayer(value) {
+  try { value ? localStorage.setItem(STORAGE_KEY, JSON.stringify(value)) : localStorage.removeItem(STORAGE_KEY); } catch { /* sin almacenamiento */ }
+}
+const pick = (list, seed) => list[seed % list.length];
+
+// ── Unirse ──
+function renderJoin(message) {
+  $('#top').hidden = true;
+  main.replaceChildren();
+  const form = el('form', 'join-form');
+  form.append(el('span', 'pill', 'Evangelización juvenil'));
+  const title = el('h1');
+  title.append('¡Entra al ', el('em', null, 'quiz'), '!');
+  form.append(title, el('div', 'muted', 'Escribe tu nombre y elige tu avatar.'));
+
+  const nameInput = el('input', 'text-input');
+  Object.assign(nameInput, { maxLength: 18, placeholder: 'Tu nombre', autocomplete: 'off', value: (player && player.name) || '' });
+  form.append(nameInput);
+
+  let chosenAvatar = (player && player.avatar) || AVATARS[Math.floor(Math.random() * AVATARS.length)];
+  const picker = el('div', 'avatar-picker');
+  for (const avatar of AVATARS) {
+    const button = el('button', avatar === chosenAvatar ? 'selected' : '', avatar);
+    button.type = 'button';
+    button.onclick = () => {
+      chosenAvatar = avatar;
+      picker.querySelectorAll('button').forEach((b) => b.classList.toggle('selected', b === button));
+    };
+    picker.append(button);
+  }
+  form.append(picker);
+
+  const error = el('div', 'error', message || '');
+  const submit = el('button', 'btn', '¡Listo, entrar!');
+  form.append(submit, error);
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    submit.disabled = true;
+    const { ok, data } = await postJson('/api/join', { name: nameInput.value, avatar: chosenAvatar }).catch(() => ({ ok: false, data: { error: 'Sin conexión' } }));
+    submit.disabled = false;
+    if (!ok) { error.textContent = data.error || 'No se pudo entrar'; return; }
+    player = data;
+    savePlayer(player);
+    connect();
+  };
+  main.append(form);
+  nameInput.focus();
+}
+
+// ── Conexión en vivo ──
+function connect() {
+  if (liveSource) liveSource.close();
+  lastRenderKey = '';
+  liveSource = connectLive(`/events?role=player&id=${encodeURIComponent(player.id)}`, {
+    state: onState,
+    connection: (online) => $('#offline').classList.toggle('show', !online),
+  });
+}
+
+function onState(state) {
+  lastState = state;
+  countdown.sync(state.remainingMs);
+  if (state.removed) {
+    liveSource.close();
+    savePlayer(null);
+    renderJoin('El juego se reinició o saliste de la sala. Vuelve a entrar 👇');
+    return;
+  }
+  updateTopBar(state.me);
+  const answered = Boolean(state.myAnswer);
+  const renderKey = [state.phase, state.questionNumber, answered].join('|');
+  if (renderKey === lastRenderKey) return;
+  lastRenderKey = renderKey;
+  (PHASE_RENDERERS[state.phase] || renderLobby)(state);
+}
+
+function updateTopBar(me) {
+  $('#top').hidden = false;
+  $('#top-avatar').textContent = me.avatar;
+  $('#top-name').textContent = me.name;
+  $('#top-score').textContent = `${me.score.toLocaleString('es-PE')} pts`;
+}
+
+// ── Pantallas por fase ──
+function renderLobby(state) {
+  const box = el('div', 'center');
+  box.append(
+    el('div', 'big-avatar', state.me.avatar),
+    el('h2', null, `¡Ya estás dentro, ${state.me.name}!`),
+    el('div', 'muted', 'Mira la pantalla del Meet. ¡Ya empezamos!'),
+    waitingDots(),
+  );
+  main.replaceChildren(box, reactionBar(state.reactions));
+}
+
+function renderIntro(state) {
+  const box = el('div', 'center');
+  box.append(
+    el('span', 'pill', state.question.category),
+    el('div', 'muted', `Pregunta ${state.questionNumber} de ${state.totalQuestions}`),
+    el('div', 'player-question', state.question.prompt),
+    el('h2', null, '¡Prepárate! 👀'),
+    waitingDots(),
+  );
+  main.replaceChildren(box);
+}
+
+function renderQuestion(state) {
+  const { question, myAnswer } = state;
+  if (myAnswer) return renderAnswerSent(question, myAnswer);
+
+  const timer = el('div', 'mini-timer');
+  timer.append(el('div'));
+  timer.dataset.total = question.seconds;
+  const nodes = [timer, el('div', 'muted', `Pregunta ${state.questionNumber} de ${state.totalQuestions}`), el('div', 'player-question', question.prompt)];
+  if (question.quote) nodes.push(el('div', 'player-quote', question.quote));
+  nodes.push(question.type === 'text' ? textAnswerForm() : optionButtons(question.options));
+  main.replaceChildren(...nodes);
+  return undefined;
+}
+
+function optionButtons(options) {
+  const list = el('div', 'player-options');
+  options.forEach((label, index) => {
+    const style = OPTION_STYLES[index];
+    const button = el('button', `option ${style.className}`);
+    button.append(el('span', 'shape', style.shape), el('span', null, label));
+    button.onclick = async () => {
+      if (list.classList.contains('locked')) return;
+      list.classList.add('locked');
+      button.classList.add('chosen');
+      vibrate(30);
+      const { ok } = await postJson('/api/answer', { id: player.id, choice: index }).catch(() => ({ ok: false }));
+      if (!ok) { list.classList.remove('locked'); button.classList.remove('chosen'); }
+    };
+    list.append(button);
+  });
+  return list;
+}
+
+function textAnswerForm() {
+  const form = el('form', 'join-form');
+  const input = el('textarea', 'text-input');
+  Object.assign(input, { maxLength: 200, placeholder: 'Ej: Mateo 28:19…' });
+  const submit = el('button', 'btn', 'Enviar respuesta');
+  const error = el('div', 'error');
+  form.append(input, submit, error);
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    submit.disabled = true;
+    const { ok, data } = await postJson('/api/answer', { id: player.id, text: input.value }).catch(() => ({ ok: false, data: {} }));
+    if (!ok) { submit.disabled = false; error.textContent = data.error || 'No se pudo enviar'; }
+  };
+  return form;
+}
+
+function renderAnswerSent(question, myAnswer) {
+  const box = el('div', 'center');
+  if (question.type === 'text') box.append(el('div', 'big-avatar', '✍️'));
+  else {
+    const style = OPTION_STYLES[myAnswer.choice];
+    const chosen = el('div', `option ${style.className}`);
+    chosen.style.padding = '18px 24px';
+    chosen.append(el('span', 'shape', style.shape), el('span', null, question.options[myAnswer.choice]));
+    box.append(chosen);
+  }
+  box.append(el('h2', null, '¡Respuesta enviada! ⏳'), el('div', 'muted', 'Esperando a los demás…'), waitingDots());
+  main.replaceChildren(box);
+}
+
+function renderReveal(state) {
+  const { question, myAnswer, questionNumber } = state;
+  const result = el('div', 'result');
+  let points = 0;
+
+  if (question.type !== 'choice') {
+    result.classList.add('neutral');
+    result.append(el('div', 'emoji', myAnswer ? '🙌' : '⏰'), el('div', 'headline', myAnswer ? pick(MESSAGES.thanks, questionNumber) : pick(MESSAGES.timeout, 0)));
+    points = myAnswer ? myAnswer.points : 0;
+  } else if (myAnswer && myAnswer.correct) {
+    result.classList.add('right');
+    result.append(el('div', 'emoji', '✅'), el('div', 'headline', pick(MESSAGES.right, questionNumber)));
+    points = myAnswer.points + myAnswer.streakBonus;
+    if (myAnswer.streakBonus) result.append(el('div', 'streak', `🔥 Racha de ${state.me.streak} · +${myAnswer.streakBonus} extra`));
+    vibrate([40, 60, 40]);
+  } else {
+    result.classList.add('wrong');
+    result.append(el('div', 'emoji', myAnswer ? '❌' : '⏰'), el('div', 'headline', myAnswer ? pick(MESSAGES.wrong, questionNumber) : pick(MESSAGES.timeout, 0)));
+    result.append(el('div', 'sub', `Era: ${question.options[question.correct]}`));
+    vibrate(200);
+  }
+  result.append(el('div', 'points', `+${points.toLocaleString('es-PE')}`), el('div', 'sub', `Vas en el puesto #${state.me.rank}`));
+  main.replaceChildren(result);
+}
+
+function renderRanking(state) {
+  const box = el('div', 'center');
+  box.append(el('div', 'muted', 'Tu posición'), el('div', 'rank-big', `#${state.me.rank}`), el('h2', null, `${state.me.score.toLocaleString('es-PE')} puntos`));
+  if (state.me.streak >= 2) box.append(el('div', 'streak', `🔥 Racha de ${state.me.streak}`));
+  box.append(el('div', 'muted', 'Mira el ranking en la pantalla 👀'));
+  main.replaceChildren(box, reactionBar(state.reactions));
+}
+
+function renderEnd(state) {
+  const { rank, score } = state.me;
+  const medals = { 1: '🥇', 2: '🥈', 3: '🥉' };
+  const box = el('div', 'center');
+  box.append(
+    el('div', 'big-avatar', medals[rank] || '🎉'),
+    el('div', 'rank-big', `#${rank}`),
+    el('h2', null, `${score.toLocaleString('es-PE')} puntos`),
+    el('div', 'muted', rank <= 3 ? '¡Estás en el podio! 🙌' : '¡Gracias por jugar! Ahora, ¡a salir a evangelizar!'),
+  );
+  main.replaceChildren(box, reactionBar(state.reactions));
+  if (rank <= 3) launchConfetti();
+}
+
+const PHASE_RENDERERS = { lobby: renderLobby, intro: renderIntro, question: renderQuestion, reveal: renderReveal, ranking: renderRanking, end: renderEnd };
+
+// ── Piezas reutilizables ──
+function waitingDots() {
+  const dots = el('div', 'waiting-dots');
+  dots.append(el('span'), el('span'), el('span'));
+  return dots;
+}
+
+function reactionBar(reactions) {
+  const bar = el('div', 'reaction-bar');
+  for (const emoji of reactions || []) {
+    const button = el('button', null, emoji);
+    button.onclick = () => { vibrate(15); postJson('/api/react', { id: player.id, emoji }).catch(() => {}); };
+    bar.append(button);
+  }
+  return bar;
+}
+
+setInterval(() => {
+  const timer = $('.mini-timer');
+  if (timer && lastState) timer.firstChild.style.width = `${countdown.fraction(Number(timer.dataset.total)) * 100}%`;
+}, 200);
+
+if (player && player.id) connect(); else renderJoin();
+</script>
+</body>
+</html>

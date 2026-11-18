@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MEG Quiz · Anfitrión</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,600;0,700;0,800;0,900;1,600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" defer></script>
+</head>
+<body>
+<div class="bg-shapes"><span></span><span></span><span></span><span></span></div>
+<div class="offline" id="offline">Reconectando…</div>
+<div class="app host">
+  <div class="host-top">
+    <div class="brand">EVANGELIZACIÓN JUVENIL · MEG</div>
+    <div class="controls">
+      <button class="icon-btn" id="sound-btn" title="Música y sonidos">🔇 Sonido</button>
+      <button class="icon-btn" id="reset-btn" title="Reiniciar puntajes">↺</button>
+    </div>
+  </div>
+  <div class="host-main" id="main"></div>
+  <div class="host-bottom" id="bottom" hidden>
+    <div class="muted" id="status"></div>
+    <button class="btn" id="next-btn"></button>
+  </div>
+</div>
+
+<script src="/common.js"></script>
+<script>
+'use strict';
+const PIN_KEY = 'meg-quiz-pin';
+const main = $('#main');
+const nextButton = $('#next-btn');
+let pin = readPin();
+let lastState = null;
+let lastRenderKey = '';
+let lastPlayerCount = 0;
+let lastTickSecond = null;
+
+function readPin() { try { return sessionStorage.getItem(PIN_KEY); } catch { return null; } }
+function storePin(value) { try { sessionStorage.setItem(PIN_KEY, value); } catch { /* sin almacenamiento */ } }
+
+// ═════ Música y efectos (sintetizados, sin archivos de audio) ═════
+const sound = {
+  ctx: null,
+  enabled: false,
+  loopTimer: null,
+  currentLoop: null,
+
+  ensureContext() {
+    if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+  },
+  toggle() {
+    this.enabled = !this.enabled;
+    if (this.enabled) this.ensureContext(); else this.stopLoop();
+    $('#sound-btn').textContent = this.enabled ? '🔊 Sonido' : '🔇 Sonido';
+    if (this.enabled && lastState) this.musicForPhase(lastState.phase);
+  },
+  midiToHz: (midi) => 440 * 2 ** ((midi - 69) / 12),
+  tone(midi, { at = 0, duration = 0.15, type = 'square', volume = 0.05, slideTo = null } = {}) {
+    if (!this.enabled || !this.ctx) return;
+    const start = this.ctx.currentTime + at;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(this.midiToHz(midi), start);
+    if (slideTo) osc.frequency.exponentialRampToValueAtTime(this.midiToHz(slideTo), start + duration);
+    gain.gain.setValueAtTime(volume, start);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+    osc.connect(gain).connect(this.ctx.destination);
+    osc.start(start);
+    osc.stop(start + duration + 0.02);
+  },
+  noise({ at = 0, duration = 0.08, volume = 0.05 } = {}) {
+    if (!this.enabled || !this.ctx) return;
+    const buffer = this.ctx.createBuffer(1, this.ctx.sampleRate * duration, this.ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < data.length; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+    const source = this.ctx.createBufferSource();
+    const gain = this.ctx.createGain();
+    gain.gain.value = volume;
+    source.buffer = buffer;
+    source.connect(gain).connect(this.ctx.destination);
+    source.start(this.ctx.currentTime + at);
+  },
+  // Un loop es una lista de pasos; cada paso puede tener melodía, bajo y percusión.
+  playLoop(name, loop) {
+    if (this.currentLoop === name) return;
+    this.stopLoop();
+    if (!this.enabled) return;
+    this.currentLoop = name;
+    let step = 0;
+    const stepMs = 60000 / loop.bpm / loop.stepsPerBeat;
+    this.loopTimer = setInterval(() => {
+      const i = step % loop.lead.length;
+      if (loop.lead[i]) this.tone(loop.lead[i], { duration: stepMs / 1000 * 0.9, type: loop.leadType, volume: 0.035 });
+      if (loop.bass[i]) this.tone(loop.bass[i], { duration: stepMs / 1000 * 1.8, type: 'triangle', volume: 0.09 });
+      if (loop.hat && loop.hat[i]) this.noise({ duration: 0.03, volume: 0.025 });
+      step += 1;
+    }, stepMs);
+  },
+  stopLoop() { clearInterval(this.loopTimer); this.loopTimer = null; this.currentLoop = null; },
+
+  musicForPhase(phase) {
+    if (phase === 'lobby' || phase === 'ranking') this.playLoop('lobby', LOBBY_LOOP);
+    else if (phase === 'question') this.playLoop('question', QUESTION_LOOP);
+    else this.stopLoop();
+  },
+  join() { this.tone(72, { duration: 0.12, type: 'sine', volume: 0.12, slideTo: 84 }); },
+  tick(urgent) { this.tone(urgent ? 88 : 81, { duration: 0.05, type: 'square', volume: 0.05 }); },
+  whoosh() { [60, 64, 67, 72].forEach((m, i) => this.tone(m, { at: i * 0.07, duration: 0.18, type: 'triangle', volume: 0.08 })); },
+  countdownBeep() { this.tone(76, { duration: 0.12, type: 'square', volume: 0.05 }); },
+  reveal() {
+    [72, 76, 79, 84].forEach((m, i) => this.tone(m, { at: i * 0.09, duration: 0.3, type: 'square', volume: 0.05 }));
+    this.tone(48, { at: 0, duration: 0.6, type: 'triangle', volume: 0.15 });
+  },
+  drumroll() {
+    for (let i = 0; i < 14; i += 1) this.noise({ at: i * 0.05, duration: 0.05, volume: 0.03 + i * 0.003 });
+    [60, 64, 67].forEach((m) => this.tone(m, { at: 0.75, duration: 0.5, type: 'triangle', volume: 0.07 }));
+  },
+  fanfare() {
+    const notes = [[67, 0], [67, 0.15], [67, 0.3], [72, 0.45], [76, 0.9], [72, 1.1], [79, 1.3]];
+    notes.forEach(([m, at]) => this.tone(m, { at, duration: 0.35, type: 'square', volume: 0.06 }));
+    this.tone(48, { at: 1.3, duration: 1.2, type: 'triangle', volume: 0.15 });
+  },
+};
+
+const LOBBY_LOOP = {
+  bpm: 118, stepsPerBeat: 2, leadType: 'square',
+  lead: [72, null, 76, 79, 76, null, 72, 74, 76, null, 79, 81, 79, 76, 74, null],
+  bass: [48, null, null, null, 55, null, null, null, 53, null, null, null, 55, null, 50, null],
+  hat: [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1],
+};
+const QUESTION_LOOP = {
+  bpm: 140, stepsPerBeat: 4, leadType: 'triangle',
+  lead: [69, 72, 76, 72, 69, 72, 76, 72, 68, 71, 76, 71, 68, 71, 76, 71],
+  bass: [45, null, null, null, 45, null, null, null, 44, null, null, null, 44, null, null, null],
+  hat: [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
+};
+
+// ═════ PIN del anfitrión ═════
+function renderPinGate(message) {
+  $('#bottom').hidden = true;
+  const gate = el('div', 'pin-gate');
+  const form = el('form', 'card');
+  const input = el('input', 'text-input');
+  Object.assign(input, { type: 'password', placeholder: 'PIN del anfitrión' });
+  const tip = el('div', 'muted', 'Tip para el Meet: comparte la PESTAÑA de Chrome (no toda la pantalla) y marca «Compartir también el audio de la pestaña» para que todos escuchen la música.');
+  tip.style.fontSize = '.85rem';
+  form.append(el('span', 'pill', 'Anfitrión'), el('h2', null, 'Entrar como anfitrión'), input, el('button', 'btn', 'Entrar'), el('div', 'error', message || ''), tip);
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    const { ok } = await postJson('/api/host', { pin: input.value, action: 'check' }).catch(() => ({ ok: false }));
+    if (!ok) { renderPinGate('PIN incorrecto'); return; }
+    pin = input.value;
+    storePin(pin);
+    connect();
+  };
+  gate.append(form);
+  main.replaceChildren(gate);
+  input.focus();
+}
+
+// ═════ Conexión en vivo ═════
+function connect() {
+  connectLive(`/events?role=host&pin=${encodeURIComponent(pin)}`, {
+    state: onState,
+    reaction: showReaction,
+    connection: (online) => $('#offline').classList.toggle('show', !online),
+  });
+}
+
+function hostAction(action, extra = {}) {
+  return postJson('/api/host', { pin, action, ...extra });
+}
+
+function onState(state) {
+  const previous = lastState;
+  lastState = state;
+  countdown.sync(state.remainingMs);
+  const renderKey = `${state.phase}|${state.questionNumber}`;
+  const phaseChanged = renderKey !== lastRenderKey;
+  lastRenderKey = renderKey;
+
+  if (phaseChanged) {
+    (PHASE_RENDERERS[state.phase] || renderLobby)(state);
+    playPhaseSound(state, previous);
+  } else {
+    refreshLiveBits(state);
+  }
+  updateBottomBar(state);
+}
+
+function playPhaseSound(state) {
+  sound.musicForPhase(state.phase);
+  if (state.phase === 'intro') sound.whoosh();
+  if (state.phase === 'reveal') sound.reveal();
+  if (state.phase === 'ranking') sound.drumroll();
+  if (state.phase === 'end') { sound.fanfare(); setTimeout(() => launchConfetti(6000), 1600); }
+}
+
+// Cambios pequeños sin redibujar toda la pantalla (evita repetir animaciones).
+function refreshLiveBits(state) {
+  if (state.phase === 'lobby') renderPlayerChips(state.players);
+  if (state.phase === 'question') {
+    const answered = $('#answered-count');
+    if (answered) answered.textContent = state.answeredCount;
+  }
+}
+
+const NEXT_LABELS = {
+  lobby: '▶ Iniciar juego',
+  intro: 'Saltar ⏭',
+  question: 'Mostrar respuesta',
+  reveal: 'Ver ranking 🏆',
+  ranking: 'Siguiente pregunta ▶',
+  end: 'Jugar de nuevo ↺',
+};
+
+function updateBottomBar(state) {
+  $('#bottom').hidden = false;
+  const isLast = state.questionNumber >= state.totalQuestions;
+  nextButton.textContent = state.phase === 'ranking' && isLast ? 'Ver podio final 🏆' : NEXT_LABELS[state.phase];
+  nextButton.disabled = state.phase === 'lobby' && state.playerCount === 0;
+  const status = state.phase === 'lobby'
+    ? 'Teclas: Espacio o → para avanzar'
+    : `Pregunta ${state.questionNumber} de ${state.totalQuestions} · ${state.playerCount} jugadores`;
+  $('#status').textContent = status;
+}
+
+function goNext() {
+  if (!lastState || nextButton.disabled) return;
+  if (lastState.phase === 'end') { hostAction('reset'); return; }
+  hostAction('next');
+}
+
+// ═════ Pantallas por fase ═════
+function renderLobby(state) {
+  const joinUrl = location.origin;
+  const left = el('div');
+  const title = el('h1');
+  title.append('¡Entra al ', el('em', null, 'quiz'), '!');
+  left.append(el('span', 'pill', 'El evangelio sale a encuentro'), title, el('div', 'muted', 'Entra desde tu celular, escribe tu nombre y espera la primera pregunta.'));
+
+  const joinBox = el('div', 'join-box');
+  const qr = el('div', 'qr');
+  qr.id = 'qr';
+  const urlBox = el('div');
+  urlBox.append(el('div', 'muted', 'Entra a:'), el('div', 'url', joinUrl.replace(/^https?:\/\//, '')));
+  joinBox.append(qr, urlBox);
+  left.append(joinBox);
+
+  const right = el('div', 'player-wall');
+  const counter = el('div');
+  counter.append(el('div', 'player-count'), el('div', 'muted', 'jugadores conectados'));
+  right.append(counter, el('div', 'chips'));
+
+  const layout = el('div', 'lobby');
+  layout.append(left, right);
+  main.replaceChildren(layout);
+  drawQr(qr, joinUrl);
+  lastPlayerCount = 0;
+  renderPlayerChips(state.players);
+}
+
+function drawQr(container, text) {
+  const draw = () => {
+    if (!window.QRCode) { container.remove(); return; }
+    new QRCode(container, { text, width: 130, height: 130, colorDark: '#101c2b', colorLight: '#ffffff' });
+  };
+  if (window.QRCode || document.readyState === 'complete') draw();
+  else window.addEventListener('load', draw, { once: true });
+}
+
+function renderPlayerChips(players) {
+  const chips = $('.chips');
+  if (!chips) return;
+  $('.player-count').textContent = players.length;
+  if (players.length > lastPlayerCount) sound.join();
+  lastPlayerCount = players.length;
+  chips.replaceChildren(...players.map((p) => {
+    const chip = el('span', 'chip');
+    const kick = el('button', null, '✕');
+    kick.title = `Sacar a ${p.name}`;
+    kick.onclick = () => hostAction('kick', { playerId: p.id });
+    chip.append(el('span', null, p.avatar), el('span', null, p.name), kick);
+    return chip;
+  }));
+}
+
+function questionHeader(state) {
+  const head = el('div', 'q-head');
+  head.append(el('span', 'pill', state.question.category), el('span', 'q-number', `Pregunta ${state.questionNumber} / ${state.totalQuestions}`));
+  return head;
+}
+
+function renderIntro(state) {
+  const box = el('div', 'intro');
+  const count = el('div', 'intro-count', '3');
+  count.id = 'intro-count';
+  box.append(el('span', 'pill', state.question.category), el('div', 'q-prompt', state.question.prompt), count, el('div', 'muted', '¡Prepárense!'));
+  main.replaceChildren(box);
+}
+
+function renderQuestion(state) {
+  const { question } = state;
+  const nodes = [questionHeader(state), el('div', 'q-prompt', question.prompt)];
+  if (question.quote) nodes.push(el('div', 'q-quote', question.quote));
+
+  const body = el('div', 'q-body');
+  body.append(timerRing(question.seconds));
+  if (question.type === 'text') {
+    const big = el('div', 'q-prompt muted', '✍️ Escriban su respuesta en el celular');
+    big.style.fontSize = '1.6rem';
+    body.append(big);
+  }
+  const answered = el('div', 'answered-box');
+  const answeredCount = el('div', 'big', state.answeredCount);
+  answeredCount.id = 'answered-count';
+  answered.append(answeredCount, el('div', 'muted', 'respuestas'));
+  body.append(answered);
+  nodes.push(body);
+
+  if (question.type !== 'text') nodes.push(optionGrid(question.options, 'host-options'));
+  main.replaceChildren(...nodes);
+}
+
+function timerRing(totalSeconds) {
+  const ring = el('div', 'timer-ring');
+  ring.id = 'timer-ring';
+  ring.dataset.total = totalSeconds;
+  ring.innerHTML = '<svg viewBox="0 0 120 120"><circle class="track" cx="60" cy="60" r="52"/><circle class="bar" cx="60" cy="60" r="52" stroke-dasharray="326.7" stroke-dashoffset="0"/></svg>';
+  ring.append(el('div', 'num', totalSeconds));
+  return ring;
+}
+
+function optionGrid(options, className, decorate) {
+  const grid = el('div', `${className}${options.length === 3 ? ' three' : ''}`);
+  options.forEach((label, index) => {
+    const style = OPTION_STYLES[index];
+    const option = el('div', `option ${style.className}`);
+    option.append(el('span', 'shape', style.shape), el('span', null, label));
+    if (decorate) decorate(option, index);
+    grid.append(option);
+  });
+  return grid;
+}
+
+function renderReveal(state) {
+  const { question, tally } = state;
+  const nodes = [questionHeader(state), el('div', 'q-prompt', question.prompt)];
+
+  if (question.type === 'text') {
+    const wall = el('div', 'text-wall');
+    if (!tally.texts.length) wall.append(el('div', 'muted', 'Nadie escribió esta vez 😅'));
+    tally.texts.forEach((answer, i) => {
+      const card = el('div', 'text-card');
+      card.style.animationDelay = `${Math.min(i * 0.08, 2)}s`;
+      card.append(el('div', 'who', `${answer.avatar} ${answer.name}`), el('div', 'what', answer.text));
+      wall.append(card);
+    });
+    nodes.push(wall);
+  } else {
+    const isScored = question.type === 'choice';
+    const isRight = (index) => !isScored || index === question.correct;
+    nodes.push(answerBars(tally.counts, isRight));
+    nodes.push(optionGrid(question.options, 'reveal-grid', (option, index) => {
+      option.classList.add('reveal-option', isRight(index) ? 'right' : 'wrong');
+      if (!isScored) option.classList.remove('right');
+      if (isScored && isRight(index)) option.append(el('span', 'tick', '✔'));
+      option.append(el('span', 'count', tally.counts[index]));
+    }));
+  }
+  if (question.note) nodes.push(el('div', 'note', question.note));
+  main.replaceChildren(...nodes);
+}
+
+function answerBars(counts, isRight) {
+  const bars = el('div', 'bars');
+  const max = Math.max(1, ...counts);
+  const fills = counts.map((count, index) => {
+    const column = el('div', `bar-col ${OPTION_STYLES[index].className}${isRight(index) ? '' : ' dim'}`);
+    const fill = el('div', 'fill');
+    column.append(el('div', 'n', count), fill, el('div', null, OPTION_STYLES[index].shape));
+    bars.append(column);
+    return [fill, count];
+  });
+  requestAnimationFrame(() => requestAnimationFrame(() => fills.forEach(([fill, count]) => { fill.style.height = `${(count / max) * 100}%`; })));
+  return bars;
+}
+
+function renderRanking(state) {
+  const box = el('div', 'ranking');
+  box.append(el('h2', null, '🏆 Ranking'));
+  if (!state.ranking.length) box.append(el('div', 'muted', 'Todavía no hay jugadores'));
+  state.ranking.forEach((row, i) => {
+    const line = el('div', `rank-row${row.rank === 1 ? ' first' : ''}`);
+    line.style.animationDelay = `${0.6 + i * 0.08}s`;
+    const movedUp = row.previousRank && row.previousRank > row.rank;
+    line.append(
+      el('span', 'pos', row.rank),
+      el('span', null, row.avatar),
+      el('span', 'name', row.name),
+      el('span', 'move', movedUp ? `▲${row.previousRank - row.rank}` : ''),
+      el('span', 'gain', row.gained ? `+${row.gained}` : ''),
+      el('span', null, row.streak >= 2 ? `🔥${row.streak}` : ''),
+      el('span', 'score', row.score.toLocaleString('es-PE')),
+    );
+    box.append(line);
+  });
+  main.replaceChildren(box);
+}
+
+function renderEnd(state) {
+  const wrap = el('div', 'podium-wrap');
+  wrap.append(el('h2', null, '¡Felicidades! 🎉'));
+  const podium = el('div', 'podium');
+  const [first, second, third] = state.ranking;
+  [[second, 2], [first, 1], [third, 3]].forEach(([row, place]) => {
+    if (!row) return;
+    const step = el('div', `step p${place}`);
+    step.append(el('div', 'avatar', row.avatar), el('div', 'pname', row.name), el('div', 'pscore', `${row.score.toLocaleString('es-PE')} pts`), el('div', 'block', place));
+    podium.append(step);
+  });
+  wrap.append(podium);
+  main.replaceChildren(wrap);
+}
+
+const PHASE_RENDERERS = { lobby: renderLobby, intro: renderIntro, question: renderQuestion, reveal: renderReveal, ranking: renderRanking, end: renderEnd };
+
+// ═════ Reacciones flotantes ═════
+function showReaction({ emoji, name }) {
+  const bubble = el('div', 'reaction', emoji);
+  bubble.append(el('small', null, name));
+  bubble.style.left = `${5 + Math.random() * 85}vw`;
+  document.body.append(bubble);
+  setTimeout(() => bubble.remove(), 3300);
+}
+
+// ═════ Reloj: anillo de tiempo, tic-tac y cuenta 3-2-1 ═════
+setInterval(() => {
+  if (!lastState) return;
+  const seconds = countdown.secondsLeft();
+  const ring = $('#timer-ring');
+  if (ring) {
+    const fraction = countdown.fraction(Number(ring.dataset.total));
+    ring.querySelector('.bar').style.strokeDashoffset = String(326.7 * (1 - fraction));
+    ring.querySelector('.num').textContent = seconds;
+    ring.classList.toggle('hurry', seconds <= 5);
+    if (seconds !== lastTickSecond && seconds > 0 && seconds <= 5) sound.tick(seconds <= 3);
+  }
+  const introCount = $('#intro-count');
+  if (introCount) {
+    const shown = Math.max(1, Math.min(3, seconds));
+    if (introCount.textContent !== String(shown)) { introCount.textContent = shown; sound.countdownBeep(); }
+  }
+  lastTickSecond = seconds;
+}, 150);
+
+// ═════ Controles ═════
+nextButton.onclick = goNext;
+$('#sound-btn').onclick = () => sound.toggle();
+$('#reset-btn').onclick = () => { if (confirm('¿Reiniciar el juego? Se borran los puntajes (los jugadores siguen conectados).')) hostAction('reset'); };
+document.addEventListener('keydown', (event) => {
+  if (event.target.matches('input, textarea')) return;
+  if (event.code === 'Space' || event.code === 'ArrowRight' || event.code === 'Enter') { event.preventDefault(); goNext(); }
+});
+
+if (pin) {
+  hostAction('check').then(({ ok }) => (ok ? connect() : renderPinGate()));
+} else {
+  renderPinGate();
+}
+</script>
+</body>
+</html>
